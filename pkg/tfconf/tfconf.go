@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
@@ -341,6 +342,7 @@ func rewriteVCLServiceResource(block *hclwrite.Block, s *tfstate.TFState, c *cli
 		body.SetAttributeValue("force_destroy", cty.BoolVal(true))
 	}
 
+	var redactedBackendBlocks []*hclwrite.Block
 	for _, nestedBlock := range body.Blocks() {
 		nestedBlockType := nestedBlock.Type()
 		nestedBlockBody := nestedBlock.Body()
@@ -401,8 +403,8 @@ func rewriteVCLServiceResource(block *hclwrite.Block, s *tfstate.TFState, c *cli
 				}
 
 				// Replace content attribute of the nested block with file function expression
-				path := filepath.Join(".", "content", c.ResourceName, filename)
-				tokens := buildFileFunction(path)
+				path := filepath.Join("content", c.ResourceName, filename)
+				tokens := buildPathModuleFileFunction(path)
 				responseBlockBody.SetAttributeRaw("content", tokens)
 			}
 		case "request_setting":
@@ -456,8 +458,8 @@ func rewriteVCLServiceResource(block *hclwrite.Block, s *tfstate.TFState, c *cli
 			}
 
 			// Replace content attribute of the nested block with file function expression
-			path := filepath.Join(".", "content", c.ResourceName, filename)
-			tokens := buildFileFunction(path)
+			path := filepath.Join("content", c.ResourceName, filename)
+			tokens := buildPathModuleFileFunction(path)
 			nestedBlockBody.SetAttributeRaw("content", tokens)
 		case "snippet":
 			// Get name from TFConf
@@ -484,8 +486,8 @@ func rewriteVCLServiceResource(block *hclwrite.Block, s *tfstate.TFState, c *cli
 			}
 
 			// Replace content attribute of the nested block with file function expression
-			path := filepath.Join(".", "vcl", c.ResourceName, filename)
-			tokens := buildFileFunction(path)
+			path := filepath.Join("vcl", c.ResourceName, filename)
+			tokens := buildPathModuleFileFunction(path)
 			nestedBlockBody.SetAttributeRaw("content", tokens)
 		case "vcl":
 			// Get name from TFConf
@@ -512,12 +514,16 @@ func rewriteVCLServiceResource(block *hclwrite.Block, s *tfstate.TFState, c *cli
 			}
 
 			// Replace content attribute of the nested block with file function expression
-			path := filepath.Join(".", "vcl", c.ResourceName, filename)
-			tokens := buildFileFunction(path)
+			path := filepath.Join("vcl", c.ResourceName, filename)
+			tokens := buildPathModuleFileFunction(path)
 			nestedBlockBody.SetAttributeRaw("content", tokens)
 		case "backend":
 			name, err := getStringAttributeValue(nestedBlock, "name")
 			if err != nil {
+				if errors.Is(err, ErrAttrNotFound) {
+					redactedBackendBlocks = append(redactedBackendBlocks, nestedBlock)
+					continue
+				}
 				return nil, err
 			}
 
@@ -543,6 +549,9 @@ func rewriteVCLServiceResource(block *hclwrite.Block, s *tfstate.TFState, c *cli
 			if strings.HasPrefix(nestedBlockType, "logging_") {
 				name, err := getStringAttributeValue(nestedBlock, "name")
 				if err != nil {
+					if errors.Is(err, ErrAttrNotFound) {
+						continue
+					}
 					return nil, err
 				}
 
@@ -565,8 +574,8 @@ func rewriteVCLServiceResource(block *hclwrite.Block, s *tfstate.TFState, c *cli
 					return nil, err
 				}
 				// Replace content attribute of the nested block with file function expression
-				path := filepath.Join(".", "logformat", c.ResourceName, filename)
-				tokens := buildFileFunction(path)
+				path := filepath.Join("logformat", c.ResourceName, filename)
+				tokens := buildPathModuleFileFunction(path)
 				nestedBlockBody.SetAttributeRaw("format", tokens)
 
 				// Handling sensitive attrs
@@ -646,6 +655,84 @@ func rewriteVCLServiceResource(block *hclwrite.Block, s *tfstate.TFState, c *cli
 					varName := naming.Normalize(name) + "_" + strings.TrimPrefix(key, "s3_")
 					nestedBlockBody.SetAttributeTraversal(key, buildVariableRef(varName))
 					sensitiveAttrs = append(sensitiveAttrs, SensitiveAttr{nestedBlockType, varName, v.String()})
+				}
+			}
+		}
+	}
+
+	if len(redactedBackendBlocks) != 0 {
+		for _, b := range redactedBackendBlocks {
+			body.RemoveBlock(b)
+		}
+
+		q := fmt.Sprintf(`.values | [.. | objects | select(has("type") and .type=="fastly_service_vcl" and .values.id=="%s")] | .[0].values.backend // []`, c.ID)
+		v, err := s.Query(q)
+		if err != nil {
+			return nil, err
+		}
+
+		backends, ok := v.Value.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("tfstate: backend is not a list")
+		}
+
+		for _, backendAny := range backends {
+			backendObj, ok := backendAny.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			var name string
+			if n, ok := backendObj["name"].(string); ok {
+				name = n
+			}
+			if name == "" {
+				if a, ok := backendObj["address"].(string); ok {
+					name = a
+				}
+			}
+
+			nb := body.AppendNewBlock("backend", nil).Body()
+
+			if name != "" {
+				nb.SetAttributeValue("name", cty.StringVal(name))
+			}
+
+			var keys []string
+			for k := range backendObj {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+
+			for _, k := range keys {
+				if k == "name" {
+					continue
+				}
+				if k == "ssl_client_cert" || k == "ssl_client_key" {
+					continue
+				}
+
+				switch t := backendObj[k].(type) {
+				case string:
+					nb.SetAttributeValue(k, cty.StringVal(t))
+				case bool:
+					nb.SetAttributeValue(k, cty.BoolVal(t))
+				case float64:
+					nb.SetAttributeValue(k, cty.NumberFloatVal(t))
+				case nil:
+					// skip
+				default:
+					// skip complex types for now (lists/maps)
+				}
+			}
+
+			// Handling sensitive attrs
+			skeys := []string{"ssl_client_cert", "ssl_client_key"}
+			for _, key := range skeys {
+				if sv, ok := backendObj[key].(string); ok && sv != "" {
+					varName := naming.Normalize(name) + "_" + key
+					nb.SetAttributeTraversal(key, buildVariableRef(varName))
+					sensitiveAttrs = append(sensitiveAttrs, SensitiveAttr{"backend", varName, sv})
 				}
 			}
 		}
@@ -740,7 +827,20 @@ func rewriteComputeServiceResource(block *hclwrite.Block, serviceProp prop.TFBlo
 		case "backend":
 			name, err := getStringAttributeValue(nestedBlock, "name")
 			if err != nil {
-				return nil, err
+				if errors.Is(err, ErrAttrNotFound) {
+					name, err = getStringAttributeValue(nestedBlock, "address")
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					return nil, err
+				}
+			}
+			if name == "" {
+				name, err = getStringAttributeValue(nestedBlock, "address")
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			// Handling sensitive attrs
@@ -945,7 +1045,7 @@ func rewriteDynamicSnippetResource(block *hclwrite.Block, serviceProp prop.TFBlo
 
 		// Replace content attribute with file function expression
 		path := filepath.Join(".", "vcl", c.ResourceName, filename)
-		tokens := buildFileFunction(path)
+		tokens := buildPathModuleFileFunction(path)
 		body.SetAttributeRaw("content", tokens)
 	}
 
@@ -1119,6 +1219,10 @@ func getStringAttributeValue(block *hclwrite.Block, attrKey string) (string, err
 	expr := attr.Expr()
 	exprTokens := expr.BuildTokens(nil)
 
+	if len(exprTokens) == 0 || exprTokens[0].Type != hclsyntax.TokenOQuote {
+		return "", nil
+	}
+
 	i := 0
 	for i < len(exprTokens) && exprTokens[i].Type != hclsyntax.TokenQuotedLit {
 		i++
@@ -1132,11 +1236,12 @@ func getStringAttributeValue(block *hclwrite.Block, attrKey string) (string, err
 	return value, nil
 }
 
-func buildFileFunction(path string) hclwrite.Tokens {
+func buildPathModuleFileFunction(path string) hclwrite.Tokens {
 	return hclwrite.Tokens{
 		{Type: hclsyntax.TokenIdent, Bytes: []byte("file")},
 		{Type: hclsyntax.TokenOParen, Bytes: []byte{'('}},
 		{Type: hclsyntax.TokenOQuote, Bytes: []byte{'"'}},
+		{Type: hclsyntax.TokenStringLit, Bytes: []byte("${path.module}/")},
 		{Type: hclsyntax.TokenQuotedLit, Bytes: []byte(path)},
 		{Type: hclsyntax.TokenCQuote, Bytes: []byte{'"'}},
 		{Type: hclsyntax.TokenCParen, Bytes: []byte{')'}},
